@@ -204,15 +204,32 @@ class KohaSIP2Emulator:
         self.books = copy.deepcopy(DEFAULT_BOOKS)
 
     def find_patron_by_card_or_uid(self, query: str) -> Optional[Dict[str, Any]]:
-        query_norm = query.strip().upper()
-        # Direct card number match
-        if query_norm in self.patrons:
-            return self.patrons[query_norm]
-        # MIFARE UID match
+        q = query.strip()
+        q_upper = q.upper()
+        q_lower = q.lower()
+        if q_lower in self.patrons:
+            return self.patrons[q_lower]
+        if q in self.patrons:
+            return self.patrons[q]
         for p in self.patrons.values():
-            if p["mifare_uid"].upper() == query_norm or p["card_number"].upper() == query_norm:
+            if p["mifare_uid"].upper() == q_upper or p["card_number"].upper() == q_upper:
                 return p
-        return None
+        # Dynamically register unlisted patron card / barcode
+        new_patron = {
+            "card_number": q,
+            "mifare_uid": f"04:{abs(hash(q)) % 256:02X}:{abs(hash(q) >> 8) % 256:02X}:1A",
+            "name": f"NFSU Patron ({q})",
+            "role": "Forensic Sciences Student",
+            "email": f"{q_lower}@nfsu.ac.in",
+            "phone": "+91 98250 11000",
+            "status": "Active (0/2 Books Issued)",
+            "pin": "Rfid@123",
+            "charged_items": [],
+            "fee_amount": "0.00",
+            "max_allowed": 2
+        }
+        self.patrons[q_lower] = new_patron
+        return new_patron
 
     def find_book_by_barcode_or_tag(self, query: str) -> Optional[Dict[str, Any]]:
         query_norm = query.strip().upper()
@@ -221,7 +238,49 @@ class KohaSIP2Emulator:
         for b in self.books.values():
             if b["tag_uid"].upper() == query_norm or b["barcode"].upper() == query_norm:
                 return b
-        return None
+        # Dynamically auto-register unlisted physical book tag for demo
+        clean_bc = query.strip()
+        new_book = {
+            "barcode": clean_bc,
+            "tag_uid": f"E0:04:01:50:{abs(hash(clean_bc)) % 256:02X}:{abs(hash(clean_bc)>>8) % 256:02X}:1A",
+            "title": f"Forensic Sciences Collection ({clean_bc})",
+            "author": "NFSU Central Library",
+            "call_number": "FS-LIB-2026",
+            "edition": "Latest Edition",
+            "location": "Main Stacks / Forensic Science",
+            "status": "Available",
+            "issued_to": None,
+            "due_date": None,
+            "afi": settings.AFI_ARMED,
+            "eas": True,
+            "renew_count": 0
+        }
+        self.books[query_norm] = new_book
+        return new_book
+
+    async def checkout(self, patron_id: str, barcode: str) -> Dict[str, Any]:
+        """Local checkout handling with 2-book limit & SIP2 12 parsing"""
+        from .sip2_protocol import SIP2MessageBuilder, SIP2MessageParser
+        builder = SIP2MessageBuilder()
+        raw_11 = builder.build_11_checkout(patron_id=patron_id, item_barcode=barcode, institution_id="NFSUGNR")
+        raw_resp = self.handle_request(raw_11)
+        return SIP2MessageParser.parse(raw_resp)
+
+    async def checkin(self, barcode: str) -> Dict[str, Any]:
+        """Local checkin handling with AFI re-arm & SIP2 10 parsing"""
+        from .sip2_protocol import SIP2MessageBuilder, SIP2MessageParser
+        builder = SIP2MessageBuilder()
+        raw_09 = builder.build_09_checkin(item_barcode=barcode, institution_id="NFSUGNR")
+        raw_resp = self.handle_request(raw_09)
+        return SIP2MessageParser.parse(raw_resp)
+
+    async def renew(self, patron_id: str, barcode: str) -> Dict[str, Any]:
+        """Local renew handling & SIP2 30 parsing"""
+        from .sip2_protocol import SIP2MessageBuilder, SIP2MessageParser
+        builder = SIP2MessageBuilder()
+        raw_29 = builder.build_29_renew(patron_id=patron_id, item_barcode=barcode, institution_id="NFSUGNR")
+        raw_resp = self.handle_request(raw_29)
+        return SIP2MessageParser.parse(raw_resp)
 
     def _append_sequence_and_checksum(self, msg_body: str, client_seq: str = "1") -> str:
         """Appends AY sequence and AZ checksum"""
