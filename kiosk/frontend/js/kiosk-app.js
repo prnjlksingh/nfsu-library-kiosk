@@ -24,6 +24,7 @@ class NFSUKioskApp {
     this.activeWorkflow = null; // 'issue', 'return', 'renew', or null (home)
     this.maxBooksAllowed = 2;
     this.availableAccounts = ['rfid', 'rfid1', 'rfid2'];
+    this._isAuthenticating = false;
   }
 
   async init() {
@@ -98,9 +99,7 @@ class NFSUKioskApp {
         this.updateTelemetryUI(msg.telemetry);
         this.padState = msg.pad_state;
         if (window.rfidPad) window.rfidPad.renderPadState(this.padState);
-        if (msg.pad_state && msg.pad_state.card_zone && msg.pad_state.card_zone.patron) {
-          this.authenticatePatron(msg.pad_state.card_zone.patron.card_number);
-        }
+        // Do not auto-authenticate on init to avoid feedback loops
         break;
 
       case 'PAD_BOOKS_UPDATED':
@@ -113,14 +112,19 @@ class NFSUKioskApp {
         this.padState = msg.data;
         if (window.rfidPad) window.rfidPad.renderPadState(this.padState);
         if (msg.data.card_zone && msg.data.card_zone.patron) {
-          this.authenticatePatron(msg.data.card_zone.patron.card_number);
+          const cardNum = msg.data.card_zone.patron.card_number;
+          if (!this.currentPatron || this.currentPatron.card_number !== cardNum) {
+            this.authenticatePatron(cardNum, false);
+          }
         }
         break;
 
       case 'PATRON_CARD_REMOVED':
         this.padState = msg.data;
         if (window.rfidPad) window.rfidPad.renderPadState(this.padState);
-        this.logoutPatron();
+        if (this.currentPatron) {
+          this.logoutPatron(false);
+        }
         break;
 
       case 'AFI_STATE_CHANGED':
@@ -228,7 +232,9 @@ class NFSUKioskApp {
     }
   }
 
-  async authenticatePatron(patronId) {
+  async authenticatePatron(patronId, syncHardware = true) {
+    if (this._isAuthenticating) return;
+    this._isAuthenticating = true;
     try {
       const resp = await fetch('/api/circulation/patron-info', {
         method: 'POST',
@@ -247,12 +253,14 @@ class NFSUKioskApp {
           screen_message: data.screen_message || ''
         };
 
-        // Also tap into hardware pad model
-        await fetch('/api/hardware/tap-card', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ card_or_uid: patronId })
-        });
+        // Only sync to hardware pad if explicitly requested AND not already present
+        if (syncHardware && (!this.padState?.card_zone?.patron || this.padState.card_zone.patron.card_number !== patronId)) {
+          await fetch('/api/hardware/tap-card', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ card_or_uid: patronId })
+          });
+        }
 
         if (window.sip2Console) window.sip2Console.renderResponse(data);
         this.renderWorkflowViews();
@@ -261,6 +269,8 @@ class NFSUKioskApp {
       }
     } catch (e) {
       console.error("Patron authentication error", e);
+    } finally {
+      this._isAuthenticating = false;
     }
   }
 
@@ -286,9 +296,11 @@ class NFSUKioskApp {
     } catch (e) {}
   }
 
-  logoutPatron() {
+  logoutPatron(syncHardware = true) {
     this.currentPatron = null;
-    fetch('/api/hardware/remove-card', { method: 'POST' });
+    if (syncHardware) {
+      fetch('/api/hardware/remove-card', { method: 'POST' }).catch(() => {});
+    }
     this.renderWorkflowViews();
   }
 
@@ -1036,16 +1048,16 @@ class NFSUKioskApp {
 
       if (e.key === 'Enter') {
         const code = barcodeBuffer.trim();
-        if (code.length >= 3) {
-          // If patron ID format
-          if (code.startsWith('rfid') || code.startsWith('NFSU2026')) {
+        if (code.length >= 2) {
+          console.log(`[Hardware Barcode/Wedge Scanned]: ${code}`);
+          if (this.activeWorkflow === 'return') {
+            this.returnBookDirect(code);
+          } else if (!this.currentPatron) {
+            // Not logged in -> treat as patron ID / student card
             this.authenticatePatron(code);
-          } else if (code.startsWith('NFSU-BK') || code.length >= 6) {
-            if (this.activeWorkflow === 'return') {
-              this.returnBookDirect(code);
-            } else {
-              this.testPlaceSingleBook(code);
-            }
+          } else {
+            // Logged in -> treat as book barcode to place on pad
+            this.testPlaceSingleBook(code);
           }
         }
         barcodeBuffer = '';

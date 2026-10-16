@@ -255,5 +255,82 @@ class RFIDHardwareBridge:
         await self._broadcast("GATE_WALKTHROUGH", gate_result)
         return gate_result
 
+    # Physical USB PC/SC Reader Hardware Monitoring (Windows Native)
+    async def hardware_monitor_loop(self):
+        """
+        Background poller for USB PC/SC Smartcard / RFID readers on Windows.
+        Automatically checks for connected readers, card taps, and card removals.
+        """
+        last_tapped_uid = None
+        while True:
+            try:
+                readers = await asyncio.to_thread(self._list_pcsc_readers)
+                if readers:
+                    reader = readers[0]
+                    uid = await asyncio.to_thread(self._read_card_uid, reader)
+                    if uid and uid != last_tapped_uid:
+                        last_tapped_uid = uid
+                        await self.tap_patron_card(uid)
+                    elif not uid and last_tapped_uid:
+                        last_tapped_uid = None
+                        await self.remove_patron_card()
+                else:
+                    if last_tapped_uid:
+                        last_tapped_uid = None
+                        await self.remove_patron_card()
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+    def _list_pcsc_readers(self) -> List[str]:
+        try:
+            import ctypes
+            from ctypes import wintypes
+            sc = ctypes.windll.winscard
+            hCtx = wintypes.HANDLE()
+            if sc.SCardEstablishContext(0, 0, 0, ctypes.byref(hCtx)) != 0:
+                return []
+            buf = ctypes.create_string_buffer(2048)
+            buflen = wintypes.DWORD(2048)
+            readers = []
+            if sc.SCardListReadersA(hCtx, None, buf, ctypes.byref(buflen)) == 0:
+                raw = buf.raw[:buflen.value].decode('ascii', errors='ignore')
+                readers = [r for r in raw.split('\x00') if r]
+            sc.SCardReleaseContext(hCtx)
+            return readers
+        except Exception:
+            return []
+
+    def _read_card_uid(self, reader_name: str) -> Optional[str]:
+        try:
+            import ctypes
+            from ctypes import wintypes
+            sc = ctypes.windll.winscard
+            hCtx = wintypes.HANDLE()
+            if sc.SCardEstablishContext(0, 0, 0, ctypes.byref(hCtx)) != 0:
+                return None
+            hCard = wintypes.HANDLE()
+            dwActiveProtocol = wintypes.DWORD()
+            ret = sc.SCardConnectA(hCtx, reader_name.encode('ascii'), 2, 3, ctypes.byref(hCard), ctypes.byref(dwActiveProtocol))
+            if ret != 0:
+                sc.SCardReleaseContext(hCtx)
+                return None
+
+            apdu = bytes([0xFF, 0xCA, 0x00, 0x00, 0x00])
+            recv_buf = ctypes.create_string_buffer(256)
+            recv_len = wintypes.DWORD(256)
+            pci = ctypes.c_void_p.in_dll(sc, "g_rgSCardT1Pci" if dwActiveProtocol.value == 2 else "g_rgSCardT0Pci")
+            ret = sc.SCardTransmit(hCard, ctypes.byref(pci), apdu, len(apdu), None, recv_buf, ctypes.byref(recv_len))
+            uid = None
+            if ret == 0 and recv_len.value >= 2:
+                res_bytes = recv_buf.raw[:recv_len.value]
+                if res_bytes[-2:] == b'\x90\x00':
+                    uid = res_bytes[:-2].hex().upper()
+            sc.SCardDisconnect(hCard, 0)
+            sc.SCardReleaseContext(hCtx)
+            return uid
+        except Exception:
+            return None
+
 # Singleton instance
 rfid_bridge = RFIDHardwareBridge()

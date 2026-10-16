@@ -80,13 +80,15 @@ async def lifespan(app: FastAPI):
         await ws_manager.broadcast(event)
     rfid_bridge.add_listener(bridge_event_handler)
 
-    # 4. Start Heartbeat worker
+    # 4. Start Heartbeat & Hardware poller workers
     hb_task = asyncio.create_task(heartbeat_worker())
+    hw_task = asyncio.create_task(rfid_bridge.hardware_monitor_loop())
 
     yield
 
     # Teardown
     hb_task.cancel()
+    hw_task.cancel()
     await sip_client.disconnect()
     await emulator.stop()
     print("[SHUTDOWN] Kiosk services terminated.")
