@@ -2,3 +2,9 @@ fastapi>=0.100.0
 uvicorn[standard]>=0.23.0
 pydantic>=2.0.0
 websockets>=11.0
+
+# Hardware: PC/SC contactless readers (patron card + ISO 15693 book pad + gate)
+pyscard>=2.0.0
+
+# Hardware: optional serial / COM-port barcode scanner
+pyserial>=3.5

@@ -10,8 +10,12 @@ Implements 3M Standard Interchange Protocol Version 2.0 (SIP2) with:
 - Message Terminator: '\r' (0x0D) or '\r\n'
 """
 
+import re
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
+
+# AY<seq>AZ<checksum> trailer emitted at the very end of every SIP2 message.
+_TRAILER_RE = re.compile(r"AY\dAZ[0-9A-Fa-f]{0,4}$")
 
 def sip_timestamp(dt: Optional[datetime] = None) -> str:
     """Format datetime to standard SIP2 format: YYYYMMDD    HHMMSS (18 chars)"""
@@ -48,6 +52,22 @@ def verify_sip2_checksum(raw_msg: str) -> Tuple[bool, Optional[str], Optional[st
     
     is_valid = (calc_hex.upper() == provided.upper())
     return (is_valid, calc_hex, provided)
+
+def _int_field(raw: str, default: int = 0) -> int:
+    """Parse a fixed-width SIP2 numeric field, tolerating spaces/blank fields."""
+    if raw is None:
+        return default
+    text = raw.strip()
+    if not text:
+        return default
+    try:
+        return int(text)
+    except ValueError:
+        try:
+            return int("".join(ch for ch in text if ch.isdigit()) or default)
+        except ValueError:
+            return default
+
 
 def parse_variable_fields(var_part: str) -> Dict[str, Any]:
     """
@@ -104,9 +124,11 @@ class SIP2MessageBuilder:
     def build_63_patron_info(self, patron_id: str, institution_id: str = "NFSU", summary: str = "  Y       ", terminal_pwd: str = "", patron_pwd: str = "") -> str:
         """
         63 Patron Information request.
-        Note: Position 3 in summary set to 'Y' requests currently charged items (AU fields)!
+        Position 3 of the 10-character summary set to 'Y' requests the
+        currently charged items (the AU fields in the 64 response).
         """
         now = sip_timestamp()
+        summary = (summary + " " * 10)[:10]
         body = f"63001{now}{summary}AO{institution_id}|AA{patron_id}|AC{terminal_pwd}|AD{patron_pwd}|"
         return self.finalize(body)
 
@@ -157,6 +179,11 @@ class SIP2MessageParser:
         result["checksum_calculated"] = calc_chk
         result["checksum_provided"] = prov_chk
 
+        # Drop the trailing AY<seq>AZ<checksum> envelope so it can never leak
+        # into the variable-field dictionary.  ``result["raw"]`` above keeps
+        # the untouched message.
+        raw_clean = _TRAILER_RE.sub("", raw_clean)
+
         try:
             if cmd_code == "94":  # Login Response
                 # Format: 94<ok: 1 char>
@@ -193,12 +220,12 @@ class SIP2MessageParser:
                     result["patron_status"] = raw_clean[2:16]
                     result["language"] = raw_clean[16:19]
                     result["transaction_date"] = raw_clean[19:37].strip()
-                    result["hold_items_count"] = int(raw_clean[37:41] or 0)
-                    result["overdue_items_count"] = int(raw_clean[41:45] or 0)
-                    result["charged_items_count"] = int(raw_clean[45:49] or 0)
-                    result["fine_items_count"] = int(raw_clean[49:53] or 0)
-                    result["recall_items_count"] = int(raw_clean[53:57] or 0)
-                    result["unavailable_holds_count"] = int(raw_clean[57:61] or 0)
+                    result["hold_items_count"] = _int_field(raw_clean[37:41])
+                    result["overdue_items_count"] = _int_field(raw_clean[41:45])
+                    result["charged_items_count"] = _int_field(raw_clean[45:49])
+                    result["fine_items_count"] = _int_field(raw_clean[49:53])
+                    result["recall_items_count"] = _int_field(raw_clean[53:57])
+                    result["unavailable_holds_count"] = _int_field(raw_clean[57:61])
                     result["fields"] = parse_variable_fields(raw_clean[61:])
                 else:
                     result["fields"] = parse_variable_fields(raw_clean[2:])

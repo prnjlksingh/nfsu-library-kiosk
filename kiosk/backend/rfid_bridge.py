@@ -3,37 +3,164 @@ NFSU Central Library Self-Service Kiosk - RFID & Smart Card Hardware Bridge
 National Forensic Sciences University, Gandhinagar
 Integrated with Koha 26 ILMS (PS-2)
 
-Controls:
-1. Top Large Zone: Avery Dennison Smartrac RaceTrack 13.56 MHz HF (ISO 15693 / NXP ICODE SLIX2)
-   - Multi-tag Anti-Collision (2 Books Simultaneously on Pad)
-   - AFI Security Byte Read/Write (0x07 Armed / 0xC2 Disarmed)
-2. Bottom-Right Compact Zone: HID OMNIKEY MIFARE Contactless Reader (ISO 14443A)
-   - Patron ID Card Tap
-3. Library Exit Security Gate Reader Zone
-   - Pass-through detection triggering Web Audio API hardware siren if AFI == 0x07
+Drives the three physical zones of the self-check station through real PC/SC
+readers (see :mod:`kiosk.backend.pcsc_reader`):
+
+1. **Book pad** - ISO 15693 HF reader (Avery Dennison Smartrac / ICODE SLIX2).
+   Multi-tag inventory so two books can sit on the pad at once, plus AFI
+   security-byte read/write (0x07 armed / 0xC2 disarmed).
+2. **Patron card** - ISO 14443A MIFARE reader (HID OMNIKEY / ACR1252). Card
+   UIDs are mapped to Koha accounts through ``hardware_map.json``.
+3. **Exit gate** - ISO 15693 antenna reader. A tag leaving with an armed AFI
+   raises the alarm.
+
+Every value surfaced here comes from real hardware or the live Koha SIP2
+server.  There is no simulated pad, no fake patron data and no auto-registered
+demo tags.
 """
 
 import asyncio
-import time
-from typing import Dict, Any, List, Optional, Callable
+import json
+import os
 from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Set
 
-from .config import settings
-from .sip2_emulator import emulator
+from .config import (
+    config,
+    hardware,
+    settings,
+    HARDWARE_MAP_PATH,
+    READER_ROLE_BOOK,
+    READER_ROLE_CARD,
+    READER_ROLE_GATE,
+)
+from .pcsc_reader import (
+    PCSCReader,
+    PCSCReaderError,
+    PYSCARD_AVAILABLE,
+    PYSCARD_IMPORT_ERROR,
+    list_readers,
+    resolve_reader_roles,
+)
+
 
 class RFIDHardwareBridge:
-    """Manages Dual-Zone Self-Check Station Pad, Card Reader, and Gate Sensors"""
-    
+    """Manages the book pad, patron card reader and exit gate."""
+
     def __init__(self):
-        # Current Physical / Simulated State
+        self.readers: Dict[str, Optional[str]] = {"card": None, "book": None, "gate": None}
+        self._readers: Dict[str, Optional[PCSCReader]] = {"card": None, "book": None, "gate": None}
+
         self.books_on_pad: List[Dict[str, Any]] = []
+        self.scanned_books: List[Dict[str, Any]] = []
         self.patron_card_on_pad: Optional[Dict[str, Any]] = None
         self.gate_event: Optional[Dict[str, Any]] = None
-        
-        self.listeners: List[Callable] = []
-        self.physical_reader_active = False
-        self._lock = asyncio.Lock()
 
+        self.listeners: List[Callable] = []
+        self.hardware_map: Dict[str, Dict[str, str]] = {"patron_cards": {}, "book_tags": {}}
+
+        self.reader_status: Dict[str, Dict[str, Any]] = {
+            "card": {"name": None, "role": READER_ROLE_CARD, "present": False, "error": None},
+            "book": {"name": None, "role": READER_ROLE_BOOK, "present": False, "error": None},
+            "gate": {"name": None, "role": READER_ROLE_GATE, "present": False, "error": None},
+        }
+        self.last_error: Optional[str] = None
+        self._lock = asyncio.Lock()
+        self._stop = asyncio.Event()
+
+        # Debounce / edge-detection state
+        self._card_uid: Optional[str] = None
+        self._card_missing = 0
+        self._book_seen: Dict[str, int] = {}
+        self._gate_cooldown_until = 0.0
+
+        self._load_hardware_map()
+        self.refresh_readers()
+
+    # ------------------------------------------------------------------
+    # Mapping table
+    # ------------------------------------------------------------------
+    def _load_hardware_map(self) -> None:
+        path = HARDWARE_MAP_PATH
+        data: Dict[str, Any] = {"patron_cards": {}, "book_tags": {}}
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    for key in ("patron_cards", "book_tags"):
+                        block = loaded.get(key)
+                        if isinstance(block, dict):
+                            data[key] = {
+                                str(k).strip().upper(): str(v).strip()
+                                for k, v in block.items()
+                            }
+        except Exception as exc:  # pragma: no cover - config error surfaced in status
+            self.last_error = f"Failed to load hardware map '{path}': {exc}"
+        self.hardware_map = data
+
+    def reload_hardware_map(self) -> Dict[str, Any]:
+        self._load_hardware_map()
+        return self.get_hardware_status()
+
+    def resolve_patron_id(self, card_uid: str) -> Optional[str]:
+        return self.hardware_map.get("patron_cards", {}).get(card_uid.strip().upper())
+
+    def resolve_book_barcode(self, tag_uid: str) -> Optional[str]:
+        return self.hardware_map.get("book_tags", {}).get(tag_uid.strip().upper())
+
+    # ------------------------------------------------------------------
+    # Reader lifecycle
+    # ------------------------------------------------------------------
+    def refresh_readers(self) -> Dict[str, Any]:
+        """Re-enumerate PC/SC readers and (re)assign kiosk roles."""
+        names = list_readers()
+        roles = resolve_reader_roles(
+            names,
+            hardware.card_reader_match,
+            hardware.book_reader_match,
+            hardware.gate_reader_match,
+        )
+        for role, name in roles.items():
+            self.readers[role] = name
+            self._readers[role] = PCSCReader(name, role=role) if name else None
+            self.reader_status[role]["name"] = name
+            self.reader_status[role]["present"] = bool(name)
+
+        if not PYSCARD_AVAILABLE:
+            self.last_error = (
+                f"pyscard is not available: {PYSCARD_IMPORT_ERROR}. "
+                "Install it with 'pip install pyscard'."
+            )
+        elif not names:
+            self.last_error = "No PC/SC readers detected. Connect the RFID readers and restart."
+        else:
+            self.last_error = None
+        return self.get_hardware_status()
+
+    def get_hardware_status(self) -> Dict[str, Any]:
+        return {
+            "pyscard_available": PYSCARD_AVAILABLE,
+            "pyscard_error": PYSCARD_IMPORT_ERROR,
+            "readers": {
+                role: {
+                    "name": self.reader_status[role]["name"],
+                    "present": self.reader_status[role]["present"],
+                    "error": self.reader_status[role]["error"],
+                }
+                for role in ("card", "book", "gate")
+            },
+            "map_file": HARDWARE_MAP_PATH,
+            "map_entries": {
+                "patron_cards": len(self.hardware_map.get("patron_cards", {})),
+                "book_tags": len(self.hardware_map.get("book_tags", {})),
+            },
+            "last_error": self.last_error,
+        }
+
+    # ------------------------------------------------------------------
+    # Event bus
+    # ------------------------------------------------------------------
     def add_listener(self, cb: Callable):
         self.listeners.append(cb)
 
@@ -41,7 +168,7 @@ class RFIDHardwareBridge:
         payload = {
             "type": event_type,
             "timestamp": datetime.now().isoformat(),
-            "data": data
+            "data": data,
         }
         for cb in self.listeners:
             try:
@@ -52,287 +179,420 @@ class RFIDHardwareBridge:
             except Exception:
                 pass
 
+    # ------------------------------------------------------------------
+    # State snapshot
+    # ------------------------------------------------------------------
     def get_pad_state(self) -> Dict[str, Any]:
-        """Returns full snapshot of both zones on the physical mat"""
+        books = list(self.books_on_pad) + list(self.scanned_books)
         return {
             "books_zone": {
-                "count": len(self.books_on_pad),
-                "books": self.books_on_pad,
+                "count": len(books),
+                "books": books,
                 "multi_collision_resolved": len(self.books_on_pad) > 1,
-                "max_allowed_on_pad": 2
+                "max_allowed_on_pad": config.max_books_allowed,
             },
             "card_zone": {
                 "card_present": self.patron_card_on_pad is not None,
-                "patron": self.patron_card_on_pad
+                "patron": self.patron_card_on_pad,
             },
-            "gate_zone": self.gate_event
+            "gate_zone": self.gate_event,
+            "hardware": self.get_hardware_status(),
         }
 
-    # Zone 1: Books Pad Actions (Smartrac RaceTrack ISO 15693 / MIFARE Classic)
-    async def place_book(self, barcode_or_uid: str, custom_title: Optional[str] = None) -> Dict[str, Any]:
-        """Place a single book on the HF RFID pad with Live Koha 26 metadata lookup"""
-        async with self._lock:
-            clean_id = barcode_or_uid.strip()
-            # Avoid duplicate on pad immediately without hitting network repeatedly
-            existing = [b for b in self.books_on_pad if b["barcode"] == clean_id or b["tag_uid"] == clean_id]
-            if existing:
-                return {"success": True, "message": "Book already on pad", "state": self.get_pad_state()}
+    # ------------------------------------------------------------------
+    # Book pad helpers
+    # ------------------------------------------------------------------
+    def _find_pad_book(self, barcode_or_uid: str) -> Optional[Dict[str, Any]]:
+        needle = barcode_or_uid.strip().upper()
+        for book in list(self.books_on_pad) + list(self.scanned_books):
+            if (book.get("barcode") or "").upper() == needle:
+                return book
+            if (book.get("tag_uid") or "").upper() == needle:
+                return book
+        return None
 
-            if len(self.books_on_pad) >= 2:
+    async def _build_book_entry(self, barcode: Optional[str], tag_uid: Optional[str],
+                                afi_hex: Optional[str], source: str) -> Dict[str, Any]:
+        """Fetch real catalogue metadata from Koha for a resolved barcode."""
+        title = None
+        author = None
+        call_number = None
+        location = None
+        known = False
+
+        if barcode:
+            try:
+                from .sip2_client import sip_client
+                item = await sip_client.get_item_info(barcode)
+                if item.get("command") == "18" and item.get("item_barcode"):
+                    fields = item.get("fields", {})
+                    title = (item.get("title") or "").strip() or None
+                    author = (item.get("author") or fields.get("CF") or "").strip() or None
+                    call_number = (fields.get("CS") or "").strip() or None
+                    location = (item.get("permanent_location") or "").strip() or None
+                    known = title is not None
+            except Exception:
+                pass
+
+        return {
+            "barcode": barcode,
+            "tag_uid": tag_uid,
+            "title": title or (f"Unknown item ({barcode})" if barcode else "Unmapped RFID tag"),
+            "author": author or "—",
+            "call_number": call_number or "—",
+            "location": location or "—",
+            "afi": afi_hex,
+            "eas": (afi_hex == settings.AFI_ARMED) if afi_hex else None,
+            "known_in_koha": known,
+            "source": source,
+            "detected_at": datetime.now().isoformat(),
+        }
+
+    # ------------------------------------------------------------------
+    # Barcode scanner input (real HID keyboard-wedge or serial scanner)
+    # ------------------------------------------------------------------
+    async def scan_book(self, barcode: str) -> Dict[str, Any]:
+        """Register a scanned book barcode; metadata is verified against Koha."""
+        clean = barcode.strip()
+        if not clean:
+            return {"success": False, "error": "Empty barcode", "state": self.get_pad_state()}
+
+        async with self._lock:
+            if self._find_pad_book(clean):
+                return {"success": True, "message": "Barcode already queued",
+                        "state": self.get_pad_state()}
+
+            total = len(self.books_on_pad) + len(self.scanned_books)
+            if total >= config.max_books_allowed:
                 return {
                     "success": False,
-                    "error": "Dual-zone pad capacity reached (Maximum 2 books at a time)",
-                    "state": self.get_pad_state()
+                    "error": f"Pad capacity reached (maximum {config.max_books_allowed} items)",
+                    "state": self.get_pad_state(),
                 }
 
-            # Query live Koha 26 for exact catalog title & data
             from .sip2_client import sip_client
-            real_title = custom_title
-            real_author = "NFSU Collection"
-            real_call = "NFSU-LIB"
-            real_loc = "Central Library Stacks"
-            try:
-                live_item = await sip_client.get_item_info(clean_id)
-                if live_item and live_item.get("title") and live_item.get("title").strip():
-                    real_title = live_item.get("title").strip()
-                    real_author = (live_item.get("author") or live_item.get("fields", {}).get("CF", "")).strip() or "NFSU Collection"
-                    real_call = live_item.get("fields", {}).get("CS", "LIB-GEN")
-                    real_loc = live_item.get("fields", {}).get("AQ", "Main Stacks")
-            except Exception:
-                pass
+            item = await sip_client.get_item_info(clean)
+            if item.get("command") != "18" or not item.get("item_barcode"):
+                # Reject unknown barcodes instead of inventing catalogue data.
+                await self._broadcast("SCAN_REJECTED", {
+                    "barcode": clean,
+                    "reason": item.get("screen_message") or item.get("error") or "Item not found in Koha",
+                })
+                return {
+                    "success": False,
+                    "error": item.get("screen_message") or item.get("error")
+                    or f"Barcode {clean} not found in Koha",
+                    "state": self.get_pad_state(),
+                }
 
-            book = {
-                "barcode": clean_id,
-                "tag_uid": clean_id if len(clean_id) in (8, 14, 16) else f"E00401{abs(hash(clean_id)) % 100000000000:012d}",
-                "title": real_title or f"Book ({clean_id})",
-                "author": real_author,
-                "call_number": real_call,
-                "location": real_loc,
-                "status": "Available",
-                "afi": settings.AFI_ARMED,
-                "eas": True,
-                "chip": "ISO 15693 / MIFARE Classic"
-            }
-
-            book_entry = {
-                "barcode": book["barcode"],
-                "tag_uid": book["tag_uid"],
-                "title": book["title"],
-                "author": book["author"],
-                "call_number": book["call_number"],
-                "status": book["status"],
-                "afi": book["afi"],
-                "eas": book["eas"],
-                "due_date": None,
-                "detected_at": datetime.now().isoformat()
-            }
-            self.books_on_pad.append(book_entry)
-            print(f"[PAD] Book Placed: Barcode={book['barcode']} | Title='{book['title']}' | AFI={book['afi']}")
+            entry = await self._build_book_entry(clean, None, None, source="scanner")
+            self.scanned_books.append(entry)
             await self._broadcast("PAD_BOOKS_UPDATED", self.get_pad_state())
-            return {"success": True, "book": book_entry, "state": self.get_pad_state()}
+            return {"success": True, "book": entry, "state": self.get_pad_state()}
 
-    async def place_two_books(self, barcode1: str, barcode2: str) -> Dict[str, Any]:
-        """Place 2 books on the pad (Multi-Tag Anti-collision)"""
+    async def scan_patron(self, barcode: str) -> Dict[str, Any]:
+        """Authenticate a patron from a scanned library-card barcode."""
+        clean = barcode.strip()
+        if not clean:
+            return {"success": False, "error": "Empty patron barcode"}
+        return await self.authenticate_patron(clean, method="barcode")
+
+    async def authenticate_patron(self, card_number: str, method: str = "barcode") -> Dict[str, Any]:
+        """Authenticate any patron identifier against live Koha (SIP2 63/64)."""
+        clean = card_number.strip()
+        if not clean:
+            return {"success": False, "error": "Empty patron identifier"}
+        return await self._set_patron(clean, card_uid=None, method=method)
+
+    async def clear_scanned(self) -> Dict[str, Any]:
+        """Drop barcode-scanner entries (RFID pad entries follow live hardware)."""
         async with self._lock:
-            self.books_on_pad.clear()
-            for bc in [barcode1, barcode2]:
-                await self.place_book(bc)
-            return {"success": True, "count": len(self.books_on_pad), "state": self.get_pad_state()}
+            self.scanned_books.clear()
+        await self._broadcast("PAD_BOOKS_UPDATED", self.get_pad_state())
+        return {"success": True, "state": self.get_pad_state()}
 
-    async def remove_books(self) -> Dict[str, Any]:
-        """Clear book pad"""
+    # ------------------------------------------------------------------
+    # Patron session
+    # ------------------------------------------------------------------
+    async def _set_patron(self, card_number: str, card_uid: Optional[str],
+                          method: str) -> Dict[str, Any]:
+        from .sip2_client import sip_client
+        response = await sip_client.get_patron_info(card_number)
+
+        if response.get("command") != "64" or response.get("valid_patron") is False:
+            reason = response.get("screen_message") or response.get("error") or "Unknown patron"
+            await self._broadcast("PATRON_AUTH_FAILED", {
+                "card_number": card_number,
+                "card_uid": card_uid,
+                "reason": reason,
+            })
+            return {"success": False, "error": reason, "patron_id": card_number}
+
+        name = (response.get("patron_name") or "").strip() or card_number
+        charged_items = response.get("charged_items") or []
+
         async with self._lock:
-            self.books_on_pad.clear()
-            await self._broadcast("PAD_BOOKS_UPDATED", self.get_pad_state())
-            return {"success": True, "state": self.get_pad_state()}
-
-    # Zone 2: Patron Card Zone (HID OMNIKEY MIFARE Reader)
-    async def tap_patron_card(self, card_or_uid: str) -> Dict[str, Any]:
-        """Tap patron MIFARE card or scan barcode with Live Koha 26 patron lookup"""
-        async with self._lock:
-            clean_uid = card_or_uid.strip()
-            from .sip2_client import sip_client
-            real_name = clean_uid
-            charged_items = []
-            
-            try:
-                koha_patron = await sip_client.get_patron_info(clean_uid)
-                p_name = (koha_patron.get("patron_name") or "").strip()
-                if p_name:
-                    real_name = p_name
-                charged_items = koha_patron.get("charged_items") or []
-            except Exception:
-                pass
-
             self.patron_card_on_pad = {
-                "card_number": clean_uid,
-                "mifare_uid": card_or_uid,
-                "name": real_name,
-                "role": "NFSU Library Patron",
-                "status": "Active",
+                "card_number": response.get("patron_id") or card_number,
+                "mifare_uid": card_uid,
+                "name": name,
                 "charged_items": charged_items,
                 "charged_count": len(charged_items),
-                "tapped_at": datetime.now().isoformat()
+                "fee_amount": response.get("fee_amount", "0.00"),
+                "method": method,
+                "tapped_at": datetime.now().isoformat(),
             }
-            print(f"[HARDWARE-PC/SC] Card Tapped: UID={card_or_uid} -> Live Koha Account={clean_uid} (Name: '{real_name}', Charged: {charged_items})")
-            await self._broadcast("PATRON_CARD_TAPPED", self.get_pad_state())
-            return {"success": True, "patron": self.patron_card_on_pad, "state": self.get_pad_state()}
 
-    async def remove_patron_card(self) -> Dict[str, Any]:
-        """Remove patron card from reader zone"""
+        await self._broadcast("PATRON_CARD_TAPPED", self.get_pad_state())
+        return {"success": True, "patron": self.patron_card_on_pad, "state": self.get_pad_state()}
+
+    async def remove_patron(self) -> Dict[str, Any]:
         async with self._lock:
             self.patron_card_on_pad = None
-            await self._broadcast("PATRON_CARD_REMOVED", self.get_pad_state())
-            return {"success": True, "state": self.get_pad_state()}
+        await self._broadcast("PATRON_CARD_REMOVED", self.get_pad_state())
+        return {"success": True, "state": self.get_pad_state()}
 
-    # Two-Phase Commit AFI Security Byte Write
-    async def write_book_afi(self, barcode: str, new_afi: str) -> Dict[str, Any]:
+    # ------------------------------------------------------------------
+    # AFI security byte write (real ISO 15693 tag)
+    # ------------------------------------------------------------------
+    async def write_book_afi(self, barcode_or_uid: str, new_afi: str) -> Dict[str, Any]:
         """
-        Hardware AFI write:
-        - During Issue: 0x07 -> 0xC2 (Disarmed) AFTER Koha responds with 121 (OK=1).
-        - During Return: 0xC2 -> 0x07 (Armed) immediately after Koha responds with 101.
+        Write the AFI byte on the physical book tag.
+
+        The barcode is resolved to a tag UID via the pad snapshot or the
+        hardware map.  The write is performed on the real reader; if the reader
+        cannot perform it, the failure is returned verbatim (never masked).
         """
-        async with self._lock:
-            book = emulator.find_book_by_barcode_or_tag(barcode)
-            if not book:
-                return {"success": False, "error": "Book not found"}
+        afi_int = int(new_afi, 16) if isinstance(new_afi, str) else int(new_afi)
 
-            old_afi = book["afi"]
-            book["afi"] = new_afi
-            book["eas"] = (new_afi == settings.AFI_ARMED)
+        book = self._find_pad_book(barcode_or_uid)
+        tag_uid = (book or {}).get("tag_uid")
+        barcode = (book or {}).get("barcode") or barcode_or_uid
 
-            # Update book in books_on_pad list if present
-            for b in self.books_on_pad:
-                if b["barcode"] == book["barcode"]:
-                    b["afi"] = new_afi
-                    b["eas"] = book["eas"]
+        if not tag_uid:
+            for uid, mapped_bc in self.hardware_map.get("book_tags", {}).items():
+                if mapped_bc.upper() == barcode_or_uid.strip().upper():
+                    tag_uid = uid
+                    barcode = mapped_bc
+                    break
 
-            event_data = {
-                "barcode": book["barcode"],
-                "title": book["title"],
-                "old_afi": old_afi,
-                "new_afi": new_afi,
-                "state": "ARMED (EAS ON)" if new_afi == settings.AFI_ARMED else "DISARMED (EAS OFF)",
-                "timestamp": datetime.now().isoformat()
+        reader = self._readers.get("book")
+        if not reader or not tag_uid:
+            reason = (
+                "No book-pad reader configured" if not reader
+                else f"No tag UID known for '{barcode_or_uid}'"
+            )
+            self.reader_status["book"]["error"] = reason
+            return {"success": False, "error": reason, "afi": new_afi}
+
+        try:
+            ok = await asyncio.to_thread(
+                reader.write_afi, tag_uid, afi_int, hardware.iso15693_append_crc
+            )
+        except PCSCReaderError as exc:
+            return {"success": False, "error": str(exc), "afi": new_afi}
+
+        if not ok:
+            return {
+                "success": False,
+                "error": "Tag refused the AFI write (tag may be locked or out of range)",
+                "afi": new_afi,
             }
-            await self._broadcast("AFI_STATE_CHANGED", event_data)
-            return {"success": True, "data": event_data}
 
-    # Zone 3: Exit Security Gate Simulator
-    async def pass_book_through_gate(self, barcode_or_uid: str) -> Dict[str, Any]:
-        """
-        Simulates an RFID tag passing through the library exit security gate antennas.
-        If AFI == 0x07: Triggers gate buzzer hardware siren!
-        If AFI == 0xC2: Gate clear chime.
-        """
-        book = emulator.find_book_by_barcode_or_tag(barcode_or_uid)
-        if not book:
-            return {"success": False, "error": "Unknown tag at gate"}
+        # Reflect the confirmed hardware state in the pad snapshot.
+        for entry in self.books_on_pad:
+            if (entry.get("tag_uid") or "").upper() == tag_uid.upper():
+                entry["afi"] = new_afi
+                entry["eas"] = (new_afi == settings.AFI_ARMED)
+        for entry in self.scanned_books:
+            if (entry.get("tag_uid") or "").upper() == tag_uid.upper():
+                entry["afi"] = new_afi
+                entry["eas"] = (new_afi == settings.AFI_ARMED)
 
-        is_alarm = (book["afi"] == settings.AFI_ARMED)
-        gate_result = {
-            "barcode": book["barcode"],
-            "title": book["title"],
-            "afi": book["afi"],
-            "alarm": is_alarm,
-            "status_text": (
-                "SECURITY GATE ALARM TRIGGERED — UNISSUED BOOK DETECTED [AFI: 0x07 ARMED]"
-                if is_alarm else
-                "GATE CLEAR — VERIFIED KOHA ISSUE [AFI: 0xC2 DISARMED]"
-            ),
-            "timestamp": datetime.now().isoformat()
+        event = {
+            "barcode": barcode,
+            "tag_uid": tag_uid,
+            "new_afi": new_afi,
+            "state": "ARMED (EAS ON)" if new_afi == settings.AFI_ARMED else "DISARMED (EAS OFF)",
+            "timestamp": datetime.now().isoformat(),
         }
-        self.gate_event = gate_result
-        await self._broadcast("GATE_WALKTHROUGH", gate_result)
-        return gate_result
+        await self._broadcast("AFI_STATE_CHANGED", event)
+        return {"success": True, "data": event}
 
-    # Physical USB PC/SC Reader Hardware Monitoring (Windows Native)
+    # ------------------------------------------------------------------
+    # Background monitor loops
+    # ------------------------------------------------------------------
     async def hardware_monitor_loop(self):
-        """
-        Background poller for USB PC/SC Smartcard / RFID readers on Windows.
-        Automatically checks for connected readers, card taps, and card removals.
-        """
-        last_tapped_uid = None
-        missing_count = 0
-        while True:
+        """Supervise the three independent hardware polling loops."""
+        self._stop.clear()
+        tasks = [
+            asyncio.create_task(self._card_reader_loop()),
+            asyncio.create_task(self._book_pad_loop()),
+            asyncio.create_task(self._gate_reader_loop()),
+            asyncio.create_task(self._reader_watchdog_loop()),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            raise
+
+    async def stop(self):
+        self._stop.set()
+
+    async def _reader_watchdog_loop(self):
+        """Re-enumerate readers periodically so hot-plugged hardware recovers."""
+        while not self._stop.is_set():
             try:
-                readers = await asyncio.to_thread(self._list_pcsc_readers)
-                if readers:
-                    reader = readers[0]
-                    uid = await asyncio.to_thread(self._read_card_uid, reader)
-                    if uid:
-                        missing_count = 0
-                        clean_uid = uid.strip().upper()
-                        if clean_uid != last_tapped_uid:
-                            last_tapped_uid = clean_uid
-                            # If patron is already authenticated, this tag is a physical BOOK placed on the pad!
-                            if self.patron_card_on_pad is not None:
-                                await self.place_book(clean_uid)
-                            else:
-                                if clean_uid.lower() in ("rfid", "rfid1", "rfid2"):
-                                    await self.tap_patron_card(clean_uid)
-                                else:
-                                    # Physical book placed on reader mat
-                                    await self.place_book(clean_uid)
-                    else:
-                        missing_count += 1
-                        if missing_count >= 3:
-                            last_tapped_uid = None
-                else:
-                    last_tapped_uid = None
+                await asyncio.sleep(10)
+                current = {r["name"] for r in self.reader_status.values() if r["name"]}
+                attached = set(list_readers())
+                if attached != current:
+                    self.refresh_readers()
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
 
-    def _list_pcsc_readers(self) -> List[str]:
-        try:
-            import ctypes
-            from ctypes import wintypes
-            sc = ctypes.windll.winscard
-            hCtx = wintypes.HANDLE()
-            if sc.SCardEstablishContext(0, 0, 0, ctypes.byref(hCtx)) != 0:
-                return []
-            buf = ctypes.create_string_buffer(2048)
-            buflen = wintypes.DWORD(2048)
-            readers = []
-            if sc.SCardListReadersA(hCtx, None, buf, ctypes.byref(buflen)) == 0:
-                raw = buf.raw[:buflen.value].decode('ascii', errors='ignore')
-                readers = [r for r in raw.split('\x00') if r]
-            sc.SCardReleaseContext(hCtx)
-            return readers
-        except Exception:
-            return []
+    async def _card_reader_loop(self):
+        while not self._stop.is_set():
+            reader = self._readers.get("card")
+            if not reader:
+                await asyncio.sleep(1.0)
+                continue
+            try:
+                uid = await asyncio.to_thread(reader.get_uid)
+            except Exception as exc:
+                self.reader_status["card"]["error"] = str(exc)
+                uid = None
 
-    def _read_card_uid(self, reader_name: str) -> Optional[str]:
-        try:
-            import ctypes
-            from ctypes import wintypes
-            sc = ctypes.windll.winscard
-            hCtx = wintypes.HANDLE()
-            if sc.SCardEstablishContext(0, 0, 0, ctypes.byref(hCtx)) != 0:
-                return None
-            hCard = wintypes.HANDLE()
-            dwActiveProtocol = wintypes.DWORD()
-            ret = sc.SCardConnectA(hCtx, reader_name.encode('ascii'), 2, 3, ctypes.byref(hCard), ctypes.byref(dwActiveProtocol))
-            if ret != 0:
-                sc.SCardReleaseContext(hCtx)
-                return None
+            if uid:
+                self._card_missing = 0
+                self.reader_status["card"]["error"] = None
+                if uid != self._card_uid:
+                    self._card_uid = uid
+                    await self._on_card_present(uid)
+            else:
+                if self._card_uid is not None:
+                    self._card_missing += 1
+                    if self._card_missing >= hardware.removal_debounce_polls:
+                        self._card_uid = None
+                        self._card_missing = 0
+                        if self.patron_card_on_pad:
+                            await self.remove_patron()
 
-            apdu = bytes([0xFF, 0xCA, 0x00, 0x00, 0x00])
-            recv_buf = ctypes.create_string_buffer(256)
-            recv_len = wintypes.DWORD(256)
-            pci = ctypes.c_void_p.in_dll(sc, "g_rgSCardT1Pci" if dwActiveProtocol.value == 2 else "g_rgSCardT0Pci")
-            ret = sc.SCardTransmit(hCard, ctypes.byref(pci), apdu, len(apdu), None, recv_buf, ctypes.byref(recv_len))
-            uid = None
-            if ret == 0 and recv_len.value >= 2:
-                res_bytes = recv_buf.raw[:recv_len.value]
-                if res_bytes[-2:] == b'\x90\x00':
-                    uid = res_bytes[:-2].hex().upper()
-            sc.SCardDisconnect(hCard, 0)
-            sc.SCardReleaseContext(hCtx)
-            return uid
-        except Exception:
-            return None
+            await asyncio.sleep(hardware.poll_interval_seconds)
+
+    async def _on_card_present(self, uid: str):
+        patron_id = self.resolve_patron_id(uid)
+        if not patron_id:
+            await self._broadcast("UNKNOWN_CARD", {
+                "card_uid": uid,
+                "message": "Card UID is not registered in hardware_map.json",
+            })
+            return
+        await self._set_patron(patron_id, card_uid=uid, method="mifare")
+
+    async def _book_pad_loop(self):
+        while not self._stop.is_set():
+            reader = self._readers.get("book")
+            if not reader:
+                await asyncio.sleep(1.0)
+                continue
+            try:
+                tag = await asyncio.to_thread(
+                    reader.read_book_tag, hardware.iso15693_append_crc
+                )
+            except Exception as exc:
+                self.reader_status["book"]["error"] = str(exc)
+                tag = None
+
+            if tag:
+                self.reader_status["book"]["error"] = None
+                self._book_seen[tag.uid] = 0
+                if not any((b.get("tag_uid") or "").upper() == tag.uid.upper()
+                           for b in self.books_on_pad):
+                    await self._on_book_present(tag.uid, tag.afi_hex)
+            else:
+                # Age out tags that are no longer on the pad.
+                stale: List[str] = []
+                for uid in list(self._book_seen.keys()):
+                    self._book_seen[uid] += 1
+                    if self._book_seen[uid] >= hardware.removal_debounce_polls:
+                        stale.append(uid)
+                for uid in stale:
+                    self._book_seen.pop(uid, None)
+                if stale:
+                    before = len(self.books_on_pad)
+                    self.books_on_pad = [
+                        b for b in self.books_on_pad
+                        if (b.get("tag_uid") or "").upper() not in {u.upper() for u in stale}
+                    ]
+                    if len(self.books_on_pad) != before:
+                        await self._broadcast("PAD_BOOKS_UPDATED", self.get_pad_state())
+
+            await asyncio.sleep(hardware.poll_interval_seconds)
+
+    async def _on_book_present(self, tag_uid: str, afi_hex: Optional[str]):
+        barcode = self.resolve_book_barcode(tag_uid)
+        entry = await self._build_book_entry(barcode, tag_uid, afi_hex, source="rfid")
+        async with self._lock:
+            # Guard against a duplicate arriving while we were fetching metadata.
+            if any((b.get("tag_uid") or "").upper() == tag_uid.upper()
+                   for b in self.books_on_pad):
+                return
+            self.books_on_pad.append(entry)
+        await self._broadcast("PAD_BOOKS_UPDATED", self.get_pad_state())
+
+    async def _gate_reader_loop(self):
+        loop = asyncio.get_event_loop()
+        while not self._stop.is_set():
+            reader = self._readers.get("gate")
+            if not reader:
+                await asyncio.sleep(1.0)
+                continue
+
+            now = loop.time()
+            if now < self._gate_cooldown_until:
+                await asyncio.sleep(hardware.poll_interval_seconds)
+                continue
+
+            try:
+                tag = await asyncio.to_thread(
+                    reader.read_book_tag, hardware.iso15693_append_crc
+                )
+            except Exception as exc:
+                self.reader_status["gate"]["error"] = str(exc)
+                tag = None
+
+            if tag:
+                self.reader_status["gate"]["error"] = None
+                self._gate_cooldown_until = now + hardware.gate_cooldown_seconds
+                await self._on_gate_tag(tag.uid, tag.afi_hex)
+
+            await asyncio.sleep(hardware.poll_interval_seconds)
+
+    async def _on_gate_tag(self, tag_uid: str, afi_hex: Optional[str]):
+        barcode = self.resolve_book_barcode(tag_uid)
+        armed = (afi_hex == settings.AFI_ARMED) if afi_hex else None
+        self.gate_event = {
+            "tag_uid": tag_uid,
+            "barcode": barcode,
+            "afi": afi_hex,
+            "alarm": bool(armed),
+            "unknown_afi": afi_hex is None,
+            "status_text": (
+                "SECURITY GATE ALARM - UNISSUED BOOK DETECTED (AFI 0x07 ARMED)"
+                if armed else
+                ("GATE CLEAR - VERIFIED KOHA ISSUE (AFI 0xC2 DISARMED)"
+                 if armed is False else
+                 "RFID TAG AFI UNREADABLE - MANUAL CHECK REQUIRED")
+            ),
+            "timestamp": datetime.now().isoformat(),
+        }
+        await self._broadcast("GATE_WALKTHROUGH", self.gate_event)
+
 
 # Singleton instance
 rfid_bridge = RFIDHardwareBridge()

@@ -1,102 +1,114 @@
-import ctypes
-from ctypes import wintypes
-import subprocess
-import json
+"""
+NFSU Central Library Self-Service Kiosk - Hardware Diagnostic Tool
+National Forensic Sciences University, Gandhinagar
 
-print("=" * 60)
-print("NFSU KIOSK HARDWARE DIAGNOSTIC TOOL")
-print("=" * 60)
+Run this on the circulation desk to:
+  * list every PC/SC contactless reader the OS can see,
+  * read the ISO 14443A UID of a card currently on a reader,
+  * inventory ISO 15693 book tags and read their AFI security byte,
+  * list serial / COM ports for a serial barcode scanner.
 
-# 1. Check PC/SC Smartcard Readers
-print("\n[1] Checking PC/SC Contactless Smartcard Readers (winscard.dll)...")
-try:
-    sc = ctypes.windll.winscard
-    hCtx = wintypes.HANDLE()
-    ret = sc.SCardEstablishContext(0, 0, 0, ctypes.byref(hCtx))
-    if ret == 0:
-        buf = ctypes.create_string_buffer(2048)
-        buflen = wintypes.DWORD(2048)
-        ret2 = sc.SCardListReadersA(hCtx, None, buf, ctypes.byref(buflen))
-        if ret2 == 0:
-            raw = buf.raw[:buflen.value].decode("ascii", errors="ignore")
-            readers = [r for r in raw.split("\x00") if r]
-            print(f"  --> FOUND {len(readers)} PC/SC Smartcard Reader(s):")
-            for idx, r in enumerate(readers, 1):
-                print(f"      {idx}. {r}")
-                
-            # Check if card is currently on the reader
-            for r in readers:
-                hCard = wintypes.HANDLE()
-                dwProto = wintypes.DWORD()
-                ret3 = sc.SCardConnectA(hCtx, r.encode('ascii'), 2, 3, ctypes.byref(hCard), ctypes.byref(dwProto))
-                if ret3 == 0:
-                    print(f"      [*] Card DETECTED on reader: {r}")
-                    # Try reading UID
-                    apdu = bytes([0xFF, 0xCA, 0x00, 0x00, 0x00])
-                    recv_buf = ctypes.create_string_buffer(256)
-                    recv_len = wintypes.DWORD(256)
-                    pci = ctypes.c_void_p.in_dll(sc, "g_rgSCardT1Pci" if dwProto.value == 2 else "g_rgSCardT0Pci")
-                    ret4 = sc.SCardTransmit(hCard, ctypes.byref(pci), apdu, len(apdu), None, recv_buf, ctypes.byref(recv_len))
-                    if ret4 == 0 and recv_len.value >= 2:
-                        res_bytes = recv_buf.raw[:recv_len.value]
-                        if res_bytes[-2:] == b'\x90\x00':
-                            uid = res_bytes[:-2].hex().upper()
-                            print(f"      [*] Card UID read successfully: {uid}")
-                        else:
-                            print(f"      [-] APDU response status: {res_bytes[-2:].hex().upper()}")
-                    sc.SCardDisconnect(hCard, 0)
-                else:
-                    print(f"      [ ] Reader is empty (no card tapped right now).")
+Usage:
+    python diagnose_hardware.py
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
+from kiosk.backend.pcsc_reader import (  # noqa: E402
+    PYSCARD_AVAILABLE,
+    PYSCARD_IMPORT_ERROR,
+    PCSCReader,
+    list_readers,
+)
+
+
+def section(title: str) -> None:
+    print("\n" + "-" * 68)
+    print(title)
+    print("-" * 68)
+
+
+def main() -> None:
+    print("=" * 68)
+    print("NFSU KIOSK HARDWARE DIAGNOSTIC")
+    print("=" * 68)
+
+    # 1. PC/SC readers -------------------------------------------------
+    section("[1] PC/SC contactless readers")
+    if not PYSCARD_AVAILABLE:
+        print(f"  [!] pyscard is not installed ({PYSCARD_IMPORT_ERROR}).")
+        print("      Install it with:  pip install pyscard")
+    else:
+        readers = list_readers()
+        print(f"  Found {len(readers)} reader(s):")
+        for idx, name in enumerate(readers, 1):
+            print(f"    {idx}. {name}")
+
+        for name in readers:
+            print(f"\n  Reader: {name}")
+            reader = PCSCReader(name)
+
+            uid = reader.get_uid()
+            if uid:
+                print(f"    [ISO 14443A] card UID = {uid}")
+            else:
+                print("    [ISO 14443A] no card present / not answering GET DATA")
+
+            tag = reader.read_book_tag()
+            if tag:
+                print(f"    [ISO 15693] tag UID = {tag.uid}  AFI = {tag.afi_hex or 'unreadable'}  DSFID = "
+                      f"{('0x%02X' % tag.dsfid) if tag.dsfid is not None else 'n/a'}")
+            else:
+                print("    [ISO 15693] no tag present / reader not in ISO 15693 mode")
+
+    # 2. Serial ports --------------------------------------------------
+    section("[2] Serial / COM ports (serial barcode scanners)")
+    try:
+        from serial.tools import list_ports
+
+        ports = list(list_ports.comports())
+        if ports:
+            for port in ports:
+                print(f"    {port.device}: {port.description}")
         else:
-            err = hex(ret2 if ret2 > 0 else (1 << 32) + ret2)
-            print(f"  --> No PC/SC reader service active (Status: {err}).")
-        sc.SCardReleaseContext(hCtx)
-    else:
-        print(f"  --> Could not establish winscard context: {hex(ret)}")
-except Exception as e:
-    print(f"  --> PC/SC check error: {e}")
+            print("  No serial ports. (HID keyboard-wedge scanners need no port.)")
+    except Exception as exc:
+        print(f"  pyserial unavailable ({exc}). Install it with: pip install pyserial")
 
-# 2. Check Windows PnP USB Devices (OMNIKEY, Smartrac, Barcode, HID, COM ports)
-print("\n[2] Checking Connected USB PnP Devices...")
-try:
-    ps_cmd = 'Get-CimInstance Win32_PnPEntity | Where-Object { $_.Present -ne $false } | Select-Object Name, Manufacturer, DeviceID, PNPClass | ConvertTo-Json'
-    output = subprocess.check_output(['powershell', '-Command', ps_cmd], text=True)
-    devices = json.loads(output)
-    if isinstance(devices, dict):
-        devices = [devices]
-    
-    matches = []
-    keywords = ['omnikey', 'smartrac', 'rfid', 'smartcard', 'cardman', 'hid', 'scanner', 'barcode', 'pos', 'serial', 'ch340', 'ftdi', 'cp210', 'acm', 'com']
-    for d in devices:
-        name = str(d.get('Name') or '')
-        mfg = str(d.get('Manufacturer') or '')
-        dev_id = str(d.get('DeviceID') or '')
-        pnp_class = str(d.get('PNPClass') or '')
-        full_text = f"{name} {mfg} {dev_id} {pnp_class}".lower()
-        if any(kw in full_text for kw in keywords):
-            matches.append(d)
-            
-    print(f"  --> Found {len(matches)} relevant hardware device(s):")
-    for m in matches:
-        print(f"      * [{m.get('PNPClass')}] {m.get('Name')} | ID: {m.get('DeviceID')}")
-except Exception as e:
-    print(f"  --> USB PnP error: {e}")
+    # 3. Windows PnP hint ---------------------------------------------
+    if os.name == "nt":
+        section("[3] Windows PnP devices (RFID / smart card / HID)")
+        try:
+            import subprocess
+            import json
 
-# 3. Check Serial / COM Ports
-print("\n[3] Checking Serial / COM Ports...")
-try:
-    ps_cmd2 = 'Get-CimInstance Win32_SerialPort | Select-Object DeviceID, Description, Name | ConvertTo-Json'
-    output2 = subprocess.check_output(['powershell', '-Command', ps_cmd2], text=True).strip()
-    if output2:
-        ports = json.loads(output2)
-        if isinstance(ports, dict):
-            ports = [ports]
-        print(f"  --> Found {len(ports)} Serial/COM Port(s):")
-        for p in ports:
-            print(f"      * {p.get('DeviceID')}: {p.get('Description') or p.get('Name')}")
-    else:
-        print("  --> No virtual COM/Serial ports detected (devices are likely HID keyboard-wedge or PC/SC).")
-except Exception as e:
-    print(f"  --> Serial check error: {e}")
+            ps = ("Get-CimInstance Win32_PnPEntity | Where-Object { $_.Present -ne $false } | "
+                  "Select-Object Name, Manufacturer, DeviceID | ConvertTo-Json")
+            out = subprocess.check_output(["powershell", "-Command", ps], text=True)
+            devices = json.loads(out) if out.strip() else []
+            if isinstance(devices, dict):
+                devices = [devices]
+            keywords = ("smartcard", "smart card", "omnikey", "rfid", "acr", "cardman",
+                        "hid", "barcode", "scanner", "usb serial", "ch340", "ftdi", "cp210")
+            shown = 0
+            for d in devices:
+                text = f"{d.get('Name','')} {d.get('Manufacturer','')} {d.get('DeviceID','')}".lower()
+                if any(k in text for k in keywords):
+                    print(f"    * {d.get('Name')} | {d.get('DeviceID')}")
+                    shown += 1
+            if shown == 0:
+                print("  No matching PnP devices found.")
+        except Exception as exc:
+            print(f"  PnP query failed: {exc}")
 
-print("\n" + "=" * 60)
+    print("\n" + "=" * 68)
+    print("Use the printed reader names with:")
+    print("    python run_kiosk.py --card-reader <name> --book-reader <name> --gate-reader <name>")
+    print("=" * 68)
+
+
+if __name__ == "__main__":
+    main()
