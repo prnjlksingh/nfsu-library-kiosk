@@ -147,7 +147,7 @@ via `POST /api/hardware/reload-map`.
 ## 🚀 Quickstart & Single-Command Launch
 
 ### 1. Prerequisites
-- **Python 3.10 or higher**
+- **Python 3.10 or higher** (see the `pyscard` wheel note below — 3.13 is safest)
 - A modern browser (Chrome, Edge, Firefox) for the touch UI
 - PC/SC contactless readers (the deployment desk uses HID OMNIKEY + ACS ACR1252)
 - A reachable Koha 26 SIP2 endpoint with a circulating service account
@@ -156,12 +156,26 @@ via `POST /api/hardware/reload-map`.
 > Windows the Smart Card service is built in. macOS uses the built-in PC/SC
 > framework.
 
+> **`pyscard` wheel note.** Prebuilt `pyscard` wheels are published for **Python
+> 3.10–3.13** on Windows/macOS/Linux. On **Python 3.14** there is no wheel yet, so
+> pip tries to compile it and fails without the **Microsoft C++ Build Tools**
+> (`error: Microsoft Visual C++ 14.0 or greater is required`). For a zero-hassle
+> install use **Python 3.13**.
+
 ### 2. Installation
 ```bash
 git clone https://github.com/prnjlksingh/nfsu-library-kiosk.git
 cd nfsu-library-kiosk
 pip install -r requirements.txt
 ```
+
+Windows (recommended — uses Python 3.13 so `pyscard` installs from a wheel):
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+Then run everything through the venv interpreter, e.g.
+`.\.venv\Scripts\python.exe run_kiosk.py --port 8000`.
 
 `requirements.txt` installs `pyscard` (PC/SC reader access) and `pyserial`
 (optional serial barcode scanner). Both are imported gracefully: the kiosk still
