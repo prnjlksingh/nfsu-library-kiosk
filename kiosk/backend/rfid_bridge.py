@@ -70,23 +70,47 @@ class RFIDHardwareBridge:
 
     # Zone 1: Books Pad Actions (Smartrac RaceTrack ISO 15693)
     async def place_book(self, barcode_or_uid: str) -> Dict[str, Any]:
-        """Place a single book on the HF RFID pad"""
+        """Place a single book on the HF RFID pad with Live Koha 26 metadata lookup"""
         async with self._lock:
+            # Query live Koha 26 first for exact catalog title & data
+            from .sip2_client import sip_client
+            real_title = None
+            real_author = None
+            real_call = "NFSU-LIB"
+            real_loc = "Central Library Stacks"
+            try:
+                live_item = await sip_client.get_item_info(barcode_or_uid)
+                if live_item and live_item.get("title") and live_item.get("title").strip():
+                    real_title = live_item.get("title").strip()
+                    real_author = (live_item.get("author") or live_item.get("fields", {}).get("CF", "")).strip() or "NFSU Collection"
+                    real_call = live_item.get("fields", {}).get("CS", "LIB-GEN")
+                    real_loc = live_item.get("fields", {}).get("AQ", "Main Stacks")
+            except Exception:
+                pass
+
             book = emulator.find_book_by_barcode_or_tag(barcode_or_uid)
             if not book:
-                # Dynamically register unlisted scanned physical book
                 book = {
                     "barcode": barcode_or_uid,
                     "tag_uid": f"E00401{abs(hash(barcode_or_uid)) % 100000000000:012d}",
-                    "title": f"Forensic Sciences Textbook ({barcode_or_uid})",
-                    "author": "NFSU Library Collection",
-                    "call_number": "FS-LIB-2026",
-                    "status": "available",
+                    "title": real_title or f"Forensic Sciences Collection ({barcode_or_uid})",
+                    "author": real_author or "NFSU Library",
+                    "call_number": real_call,
+                    "status": "Available",
                     "afi": settings.AFI_ARMED,
                     "eas": True,
                     "chip": "Smartrac RaceTrack ISO 15693"
                 }
                 emulator.books[barcode_or_uid] = book
+            else:
+                if real_title:
+                    book["title"] = real_title
+                if real_author:
+                    book["author"] = real_author
+                if real_call:
+                    book["call_number"] = real_call
+                if real_loc:
+                    book["location"] = real_loc
 
             # Avoid duplicate on pad
             existing = [b for b in self.books_on_pad if b["barcode"] == book["barcode"]]
@@ -113,28 +137,28 @@ class RFIDHardwareBridge:
                 "detected_at": datetime.now().isoformat()
             }
             self.books_on_pad.append(book_entry)
+            print(f"[PAD] Book Placed: Barcode={book['barcode']} | Title='{book['title']}' | AFI={book['afi']}")
             await self._broadcast("PAD_BOOKS_UPDATED", self.get_pad_state())
             return {"success": True, "book": book_entry, "state": self.get_pad_state()}
 
-    async def place_two_books(self, barcode1: str = "NFSU-BK-104", barcode2: str = "NFSU-BK-105") -> Dict[str, Any]:
+    async def place_two_books(self, barcode1: str = "B008923", barcode2: str = "B008928") -> Dict[str, Any]:
         """Simulate placing 2 books simultaneously on the pad (ISO 15693 Anti-collision)"""
         async with self._lock:
             self.books_on_pad.clear()
+            from .sip2_client import sip_client
             for bc in [barcode1, barcode2]:
+                real_title = None
+                try:
+                    live_item = await sip_client.get_item_info(bc)
+                    if live_item and live_item.get("title") and live_item.get("title").strip():
+                        real_title = live_item.get("title").strip()
+                except Exception:
+                    pass
+
                 book = emulator.find_book_by_barcode_or_tag(bc)
-                if not book:
-                    book = {
-                        "barcode": bc,
-                        "tag_uid": f"E00401{abs(hash(bc)) % 100000000000:012d}",
-                        "title": f"Forensic Sciences Textbook ({bc})",
-                        "author": "NFSU Library Collection",
-                        "call_number": "FS-LIB-2026",
-                        "status": "available",
-                        "afi": settings.AFI_ARMED,
-                        "eas": True,
-                        "chip": "Smartrac RaceTrack ISO 15693"
-                    }
-                    emulator.books[bc] = book
+                if real_title:
+                    book["title"] = real_title
+
                 self.books_on_pad.append({
                     "barcode": book["barcode"],
                     "tag_uid": book["tag_uid"],
@@ -163,7 +187,7 @@ class RFIDHardwareBridge:
 
     # Zone 2: Patron Card Zone (HID OMNIKEY MIFARE Reader)
     async def tap_patron_card(self, card_or_uid: str) -> Dict[str, Any]:
-        """Tap patron MIFARE card or scan barcode"""
+        """Tap patron MIFARE card or scan barcode with Live Koha 26 patron lookup"""
         async with self._lock:
             # Map physical MIFARE UID to Koha account if configured
             clean_uid = card_or_uid.strip().upper()
@@ -173,29 +197,42 @@ class RFIDHardwareBridge:
             if len(clean_uid) in (8, 14) and all(c in '0123456789ABCDEF' for c in clean_uid) and mapped_account == card_or_uid:
                 mapped_account = "rfid"
 
+            # Query real patron name from live Koha 26
+            real_name = mapped_account
+            try:
+                from .sip2_client import sip_client
+                koha_patron = await sip_client.get_patron_info(mapped_account)
+                p_name = (koha_patron.get("patron_name") or "").strip()
+                if p_name:
+                    real_name = p_name
+            except Exception:
+                pass
+
             patron = emulator.find_patron_by_card_or_uid(mapped_account)
             if not patron:
                 patron = {
                     "card_number": mapped_account,
                     "mifare_uid": card_or_uid,
-                    "name": f"NFSU Patron ({mapped_account})",
-                    "role": "Forensic Sciences Student",
-                    "status": "active",
+                    "name": real_name,
+                    "role": "NFSU Library Patron",
+                    "status": "Active",
                     "charged_items": []
                 }
                 emulator.patrons[mapped_account] = patron
+            else:
+                patron["name"] = real_name
 
             self.patron_card_on_pad = {
                 "card_number": mapped_account,
                 "mifare_uid": card_or_uid,
-                "name": patron.get("name", f"NFSU Patron ({mapped_account})"),
-                "role": patron.get("role", "Forensic Sciences Student"),
-                "status": patron.get("status", "active"),
+                "name": real_name,
+                "role": "NFSU Library Patron",
+                "status": "Active",
                 "charged_items": patron.get("charged_items", []),
                 "charged_count": len(patron.get("charged_items", [])),
                 "tapped_at": datetime.now().isoformat()
             }
-            print(f"[HARDWARE-PC/SC] Card Tapped: UID={card_or_uid} -> Mapped Koha Account={mapped_account}")
+            print(f"[HARDWARE-PC/SC] Card Tapped: UID={card_or_uid} -> Mapped Koha Account={mapped_account} (Name: '{real_name}')")
             await self._broadcast("PATRON_CARD_TAPPED", self.get_pad_state())
             return {"success": True, "patron": self.patron_card_on_pad, "state": self.get_pad_state()}
 

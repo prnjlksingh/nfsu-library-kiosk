@@ -531,11 +531,11 @@ class NFSUKioskApp {
               </p>
             </div>
             <div style="display:flex; gap:8px;">
-              <button class="btn-back-home" style="padding:4px 12px; font-size:11.5px; border-color:var(--nfsu-gold); color:var(--nfsu-gold);" onclick="window.kioskApp.testPlaceSingleBook('NFSU-BK-104')">
-                + Place 1 Book
+              <button class="btn-back-home" style="padding:4px 12px; font-size:11.5px; border-color:var(--nfsu-gold); color:var(--nfsu-gold);" onclick="window.kioskApp.testPlaceSingleBook('B008923')">
+                + Place B008923 (Live Book)
               </button>
-              <button class="btn-back-home" style="padding:4px 12px; font-size:11.5px; border-color:#38bdf8; color:#bae6fd;" onclick="window.kioskApp.testPlaceTwoBooks('NFSU-BK-104', 'NFSU-BK-105')">
-                + Place 2 Books (Multi-Tag)
+              <button class="btn-back-home" style="padding:4px 12px; font-size:11.5px; border-color:#38bdf8; color:#bae6fd;" onclick="window.kioskApp.testPlaceTwoBooks('B008923', 'B008928')">
+                + Place 2 Books (B008923 & B008928)
               </button>
               <button class="btn-back-home" style="padding:4px 12px; font-size:11.5px; border-color:#fca5a5; color:#fca5a5;" onclick="window.kioskApp.testRemoveBooks()">
                 Clear Pad
@@ -552,13 +552,13 @@ class NFSUKioskApp {
           <div style="grid-column: 1 / -1; background:rgba(255,255,255,0.04); border:2px dashed rgba(255,255,255,0.2); border-radius:14px; padding:28px; text-align:center;">
             <i class="fas fa-book-open" style="font-size:36px; color:#64748b; margin-bottom:8px;"></i>
             <h5 style="color:#ffffff; margin:0 0 4px 0; font-size:15px;">No Books Detected on RFID Pad</h5>
-            <p style="font-size:12px; color:#94a3b8; margin:0 0 12px 0;">Place 1 or 2 forensic science textbooks on the pad to proceed.</p>
+            <p style="font-size:12px; color:#94a3b8; margin:0 0 12px 0;">Place 1 or 2 textbooks on the pad or scan their barcodes with your reader.</p>
             <div style="display:flex; justify-content:center; gap:10px;">
-              <button class="btn-nfsu-action" style="padding:8px 18px; font-size:12.5px;" onclick="window.kioskApp.testPlaceSingleBook('NFSU-BK-104')">
-                <i class="fas fa-hand-holding"></i> Place Single Book (NFSU-BK-104)
+              <button class="btn-nfsu-action" style="padding:8px 18px; font-size:12.5px;" onclick="window.kioskApp.testPlaceSingleBook('B008923')">
+                <i class="fas fa-hand-holding"></i> Place Live Book (B008923 - Python for Data Analysis)
               </button>
-              <button class="btn-nfsu-action" style="background:#38bdf8; color:#001b3a; padding:8px 18px; font-size:12.5px;" onclick="window.kioskApp.testPlaceTwoBooks('NFSU-BK-104', 'NFSU-BK-105')">
-                <i class="fas fa-layer-group"></i> Simulate Placing 2 Books (PS-2 Judge Control)
+              <button class="btn-nfsu-action" style="background:#38bdf8; color:#001b3a; padding:8px 18px; font-size:12.5px;" onclick="window.kioskApp.testPlaceTwoBooks('B008923', 'B008928')">
+                <i class="fas fa-layer-group"></i> Simulate 2 Live Books (B008923 + B008928)
               </button>
             </div>
           </div>
@@ -613,7 +613,7 @@ class NFSUKioskApp {
       html += `
         <div style="background:rgba(0,15,36,0.5); border:1px solid rgba(255,255,255,0.1); border-radius:10px; padding:10px 14px; display:flex; gap:10px; align-items:center; margin-bottom:14px;">
           <i class="fas fa-barcode" style="color:var(--nfsu-gold); font-size:18px;"></i>
-          <input type="text" id="manual-book-barcode-input" placeholder="Scan book barcode with handheld reader or type barcode..."
+          <input type="text" id="manual-book-barcode-input" placeholder="Scan book barcode (e.g. B008923) or type barcode..."
                  style="flex:1; background:transparent; border:none; outline:none; color:white; font-size:13px;"
                  onkeydown="if(event.key==='Enter') { window.kioskApp.testPlaceSingleBook(this.value); this.value=''; }">
           <button class="btn-back-home" style="padding:4px 12px; font-size:11.5px;" onclick="const el=document.getElementById('manual-book-barcode-input'); window.kioskApp.testPlaceSingleBook(el.value); el.value='';">
