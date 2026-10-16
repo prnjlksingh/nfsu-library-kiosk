@@ -157,33 +157,45 @@ class RFIDHardwareBridge:
             await self._broadcast("PAD_BOOKS_UPDATED", self.get_pad_state())
             return {"success": True, "state": self.get_pad_state()}
 
+    CARD_TO_PATRON_MAP: Dict[str, str] = {
+        "D73F5374": "rfid",  # Physical HID OMNIKEY MIFARE card
+    }
+
     # Zone 2: Patron Card Zone (HID OMNIKEY MIFARE Reader)
     async def tap_patron_card(self, card_or_uid: str) -> Dict[str, Any]:
         """Tap patron MIFARE card or scan barcode"""
         async with self._lock:
-            patron = emulator.find_patron_by_card_or_uid(card_or_uid)
+            # Map physical MIFARE UID to Koha account if configured
+            clean_uid = card_or_uid.strip().upper()
+            mapped_account = self.CARD_TO_PATRON_MAP.get(clean_uid, card_or_uid)
+            
+            # If it's a raw hex UID and not in Koha accounts, map to default live account 'rfid'
+            if len(clean_uid) in (8, 14) and all(c in '0123456789ABCDEF' for c in clean_uid) and mapped_account == card_or_uid:
+                mapped_account = "rfid"
+
+            patron = emulator.find_patron_by_card_or_uid(mapped_account)
             if not patron:
-                # Dynamically register unlisted patron card / barcode
                 patron = {
-                    "card_number": card_or_uid,
-                    "mifare_uid": f"04:{abs(hash(card_or_uid)) % 256:02X}:{abs(hash(card_or_uid) >> 8) % 256:02X}:1A",
-                    "name": f"NFSU Patron ({card_or_uid})",
+                    "card_number": mapped_account,
+                    "mifare_uid": card_or_uid,
+                    "name": f"NFSU Patron ({mapped_account})",
                     "role": "Forensic Sciences Student",
                     "status": "active",
                     "charged_items": []
                 }
-                emulator.patrons[card_or_uid] = patron
+                emulator.patrons[mapped_account] = patron
 
             self.patron_card_on_pad = {
-                "card_number": patron["card_number"],
-                "mifare_uid": patron["mifare_uid"],
-                "name": patron["name"],
-                "role": patron["role"],
-                "status": patron["status"],
-                "charged_items": patron["charged_items"],
-                "charged_count": len(patron["charged_items"]),
+                "card_number": mapped_account,
+                "mifare_uid": card_or_uid,
+                "name": patron.get("name", f"NFSU Patron ({mapped_account})"),
+                "role": patron.get("role", "Forensic Sciences Student"),
+                "status": patron.get("status", "active"),
+                "charged_items": patron.get("charged_items", []),
+                "charged_count": len(patron.get("charged_items", [])),
                 "tapped_at": datetime.now().isoformat()
             }
+            print(f"[HARDWARE-PC/SC] Card Tapped: UID={card_or_uid} -> Mapped Koha Account={mapped_account}")
             await self._broadcast("PATRON_CARD_TAPPED", self.get_pad_state())
             return {"success": True, "patron": self.patron_card_on_pad, "state": self.get_pad_state()}
 
