@@ -99,7 +99,12 @@ class NFSUKioskApp {
         this.updateTelemetryUI(msg.telemetry);
         this.padState = msg.pad_state;
         if (window.rfidPad) window.rfidPad.renderPadState(this.padState);
-        // Do not auto-authenticate on init to avoid feedback loops
+        if (msg.pad_state && msg.pad_state.card_zone && msg.pad_state.card_zone.patron && msg.pad_state.card_zone.card_present) {
+          const cardNum = msg.pad_state.card_zone.patron.card_number;
+          if (!this.currentPatron || this.currentPatron.card_number !== cardNum) {
+            this.authenticatePatron(cardNum, false);
+          }
+        }
         break;
 
       case 'PAD_BOOKS_UPDATED':
