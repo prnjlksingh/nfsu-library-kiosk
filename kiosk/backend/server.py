@@ -19,7 +19,6 @@ from pydantic import BaseModel
 from .config import config, settings
 from .sip2_protocol import SIP2MessageBuilder, SIP2MessageParser
 from .sip2_client import sip_client
-from .sip2_emulator import emulator
 from .rfid_bridge import rfid_bridge
 from .biometrics import biometrics
 
@@ -64,23 +63,16 @@ async def heartbeat_worker():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Start Koha 26 SIP2 Server Emulator
-    print("[INIT] Starting Built-In Koha 26 SIP2 Server Emulator on port 6001...")
-    try:
-        await emulator.start()
-    except Exception as e:
-        print(f"[INIT] Note: Emulator port check: {e}")
-
-    # 2. Connect SIP2 Client
-    print(f"[INIT] Connecting SIP2 Client to {config.sip_host}:{config.sip_port}...")
+    # 1. Connect SIP2 Client to Live Koha 26 Server
+    print(f"[INIT] Connecting SIP2 Client to Live Koha at {config.sip_host}:{config.sip_port}...")
     await sip_client.connect()
 
-    # 3. Hook RFID Bridge events to WebSocket broadcaster
+    # 2. Hook RFID Bridge events to WebSocket broadcaster
     async def bridge_event_handler(event: Dict[str, Any]):
         await ws_manager.broadcast(event)
     rfid_bridge.add_listener(bridge_event_handler)
 
-    # 4. Start Heartbeat & Hardware poller workers
+    # 3. Start Heartbeat & Hardware poller workers
     hb_task = asyncio.create_task(heartbeat_worker())
     hw_task = asyncio.create_task(rfid_bridge.hardware_monitor_loop())
 
@@ -90,7 +82,6 @@ async def lifespan(app: FastAPI):
     hb_task.cancel()
     hw_task.cancel()
     await sip_client.disconnect()
-    await emulator.stop()
     print("[SHUTDOWN] Kiosk services terminated.")
 
 app = FastAPI(
@@ -166,15 +157,6 @@ async def api_patron_info(payload: PatronQuery):
     Returns charged items count (How many Books issued) & AU barcodes.
     """
     res = await sip_client.get_patron_info(payload.patron_id)
-    # Merge session-issued books from local model if present
-    emul_patron = emulator.patrons.get(payload.patron_id)
-    if emul_patron and emul_patron.get("charged_items"):
-        existing_items = set(res.get("charged_items", []))
-        for itm in emul_patron["charged_items"]:
-            if itm not in existing_items:
-                existing_items.add(itm)
-        res["charged_items"] = list(existing_items)
-        res["charged_items_count"] = len(res["charged_items"])
     
     # Broadcast telemetry
     await ws_manager.broadcast({"type": "SIP2_TELEMETRY", "data": sip_client.get_telemetry()})
@@ -182,22 +164,15 @@ async def api_patron_info(payload: PatronQuery):
 
 @app.get("/api/circulation/item-info")
 async def api_item_info(barcode: str = Query(..., description="Item Barcode or Tag UID")):
-    """SIP2 17 -> 18 Item Information lookup"""
+    """SIP2 17 -> 18 Item Information lookup from Live Koha 26"""
     res = await sip_client.get_item_info(barcode)
-    if not res.get("title") or res.get("title").strip() == "":
-        emul_book = emulator.find_book_by_barcode_or_tag(barcode)
-        if emul_book:
-            res["title"] = emul_book["title"]
-            res["author"] = emul_book["author"]
-            res["circulation_status"] = emul_book["status"]
     return res
 
 @app.post("/api/circulation/checkout")
 async def api_checkout(payload: CheckoutRequest):
     """
-    SIP2 11 -> 12 Issue / Checkout
+    SIP2 11 -> 12 Issue / Checkout on Live Koha 26
     Strict 2-Phase Commit: Only disarms AFI to 0xC2 (EAS off) AFTER Koha responds with 121 (OK=1).
-    Seamless fallback: If competition server has not seeded this specific hardware tag, authorizes locally.
     """
     sip_resp = await sip_client.checkout(payload.patron_id, payload.item_barcode)
     
@@ -208,20 +183,7 @@ async def api_checkout(payload: CheckoutRequest):
         sip_resp["rfid_afi_update"] = afi_res
         sip_resp["two_phase_commit"] = "SUCCESS: Tag Disarmed (AFI: 0xC2 / EAS OFF - Live Koha)"
     else:
-        # Check if live server returned 'Invalid Item' (unseeded barcode) or timeout
-        err_msg = sip_resp.get("screen_message") or sip_resp.get("fields", {}).get("AF", "")
-        if "Invalid Item" in err_msg or "timed out" in str(sip_resp.get("error", "")):
-            emulated_resp = await emulator.checkout(payload.patron_id, payload.item_barcode)
-            if emulated_resp.get("ok"):
-                sip_resp = emulated_resp
-                afi_res = await rfid_bridge.write_book_afi(payload.item_barcode, settings.AFI_DISARMED)
-                sip_resp["rfid_afi_update"] = afi_res
-                sip_resp["two_phase_commit"] = "SUCCESS: Tag Disarmed (AFI: 0xC2 / EAS OFF - Verified Session)"
-            else:
-                sip_resp = emulated_resp
-                sip_resp["two_phase_commit"] = "BLOCKED: 2-Book Limit Exceeded or Tag Blocked"
-        else:
-            sip_resp["two_phase_commit"] = "BLOCKED: Tag Remains Armed (AFI: 0x07 / EAS ON)"
+        sip_resp["two_phase_commit"] = "BLOCKED: Tag Remains Armed (AFI: 0x07 / EAS ON)"
 
     await ws_manager.broadcast({"type": "CIRCULATION_TRANSACTION", "data": sip_resp})
     await ws_manager.broadcast({"type": "SIP2_TELEMETRY", "data": sip_client.get_telemetry()})
@@ -230,7 +192,7 @@ async def api_checkout(payload: CheckoutRequest):
 @app.post("/api/circulation/checkin")
 async def api_checkin(payload: CheckinRequest):
     """
-    SIP2 09 -> 10 Return / Check-in
+    SIP2 09 -> 10 Return / Check-in on Live Koha 26
     Strict 2-Phase Commit: Re-arms AFI to 0x07 (EAS on) immediately upon Koha 101 confirmation.
     """
     sip_resp = await sip_client.checkin(payload.item_barcode)
@@ -241,16 +203,7 @@ async def api_checkin(payload: CheckinRequest):
         sip_resp["rfid_afi_update"] = afi_res
         sip_resp["two_phase_commit"] = "SUCCESS: Tag Re-armed (AFI: 0x07 / EAS ON - Live Koha)"
     else:
-        err_msg = sip_resp.get("screen_message") or sip_resp.get("fields", {}).get("AF", "")
-        if "Invalid Item" in err_msg or "timed out" in str(sip_resp.get("error", "")):
-            emulated_resp = await emulator.checkin(payload.item_barcode)
-            if emulated_resp.get("ok"):
-                sip_resp = emulated_resp
-                afi_res = await rfid_bridge.write_book_afi(payload.item_barcode, settings.AFI_ARMED)
-                sip_resp["rfid_afi_update"] = afi_res
-                sip_resp["two_phase_commit"] = "SUCCESS: Tag Re-armed (AFI: 0x07 / EAS ON - Verified Session)"
-            else:
-                sip_resp["two_phase_commit"] = "BLOCKED"
+        sip_resp["two_phase_commit"] = "FAILED: Return Rejected by Koha"
 
     await ws_manager.broadcast({"type": "CIRCULATION_TRANSACTION", "data": sip_resp})
     await ws_manager.broadcast({"type": "SIP2_TELEMETRY", "data": sip_client.get_telemetry()})
@@ -258,13 +211,8 @@ async def api_checkin(payload: CheckinRequest):
 
 @app.post("/api/circulation/renew")
 async def api_renew(payload: RenewRequest):
-    """SIP2 29 -> 30 Renewal"""
+    """SIP2 29 -> 30 Renewal on Live Koha 26"""
     sip_resp = await sip_client.renew(payload.patron_id, payload.item_barcode)
-    if not sip_resp.get("ok"):
-        err_msg = sip_resp.get("screen_message") or sip_resp.get("fields", {}).get("AF", "")
-        if "Invalid" in err_msg or "timed out" in str(sip_resp.get("error", "")):
-            sip_resp = await emulator.renew(payload.patron_id, payload.item_barcode)
-
     await ws_manager.broadcast({"type": "CIRCULATION_TRANSACTION", "data": sip_resp})
     await ws_manager.broadcast({"type": "SIP2_TELEMETRY", "data": sip_client.get_telemetry()})
     return sip_resp
@@ -275,8 +223,11 @@ async def api_get_pad_state():
     return rfid_bridge.get_pad_state()
 
 @app.post("/api/hardware/place-book")
-async def api_place_book(barcode: str = Body(..., embed=True)):
-    return await rfid_bridge.place_book(barcode)
+async def api_place_book(
+    barcode: str = Body(..., embed=True),
+    title: Optional[str] = Body(None, embed=True)
+):
+    return await rfid_bridge.place_book(barcode, custom_title=title)
 
 @app.post("/api/hardware/place-two-books")
 async def api_place_two_books(

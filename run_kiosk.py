@@ -21,7 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description="NFSU Central Library Kiosk Integrated with Koha 26 (PS-2)")
     parser.add_argument("--host", default="0.0.0.0", help="HTTP Server Host")
     parser.add_argument("--port", type=int, default=8000, help="HTTP Server Port")
-    parser.add_argument("--sip-host", default="127.0.0.1", help="Koha SIP2 Host")
+    parser.add_argument("--sip-host", default="117.239.182.15", help="Koha SIP2 Host")
     parser.add_argument("--sip-port", type=int, default=6001, help="Koha SIP2 Port")
     args = parser.parse_args()
 

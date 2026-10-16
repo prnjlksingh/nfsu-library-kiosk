@@ -456,6 +456,9 @@ class NFSUKioskApp {
                   <button class="btn-back-home" style="padding:4px 10px; font-size:11px; justify-content:center; border-color:var(--nfsu-gold); color:var(--nfsu-gold);" onclick="window.kioskApp.quickAuthenticateLive('rfid1')">
                     Live: rfid1 (Rfid1@123)
                   </button>
+                  <button class="btn-back-home" style="padding:4px 10px; font-size:11px; justify-content:center; border-color:#34d399; color:#34d399;" onclick="window.kioskApp.quickAuthenticateLive('rfid2')">
+                    Live: rfid2 (0/2 Issued - Ready to Issue!)
+                  </button>
                 </div>
               </div>
 
@@ -531,14 +534,8 @@ class NFSUKioskApp {
               </p>
             </div>
             <div style="display:flex; gap:8px;">
-              <button class="btn-back-home" style="padding:4px 12px; font-size:11.5px; border-color:var(--nfsu-gold); color:var(--nfsu-gold);" onclick="window.kioskApp.testPlaceSingleBook('B008923')">
-                + Place B008923 (Live Book)
-              </button>
-              <button class="btn-back-home" style="padding:4px 12px; font-size:11.5px; border-color:#38bdf8; color:#bae6fd;" onclick="window.kioskApp.testPlaceTwoBooks('B008923', 'B008928')">
-                + Place 2 Books (B008923 & B008928)
-              </button>
               <button class="btn-back-home" style="padding:4px 12px; font-size:11.5px; border-color:#fca5a5; color:#fca5a5;" onclick="window.kioskApp.testRemoveBooks()">
-                Clear Pad
+                <i class="fas fa-trash"></i> Clear Pad
               </button>
             </div>
           </div>
@@ -551,16 +548,10 @@ class NFSUKioskApp {
         html += `
           <div style="grid-column: 1 / -1; background:rgba(255,255,255,0.04); border:2px dashed rgba(255,255,255,0.2); border-radius:14px; padding:28px; text-align:center;">
             <i class="fas fa-book-open" style="font-size:36px; color:#64748b; margin-bottom:8px;"></i>
-            <h5 style="color:#ffffff; margin:0 0 4px 0; font-size:15px;">No Books Detected on RFID Pad</h5>
-            <p style="font-size:12px; color:#94a3b8; margin:0 0 12px 0;">Place 1 or 2 textbooks on the pad or scan their barcodes with your reader.</p>
-            <div style="display:flex; justify-content:center; gap:10px;">
-              <button class="btn-nfsu-action" style="padding:8px 18px; font-size:12.5px;" onclick="window.kioskApp.testPlaceSingleBook('B008923')">
-                <i class="fas fa-hand-holding"></i> Place Live Book (B008923 - Python for Data Analysis)
-              </button>
-              <button class="btn-nfsu-action" style="background:#38bdf8; color:#001b3a; padding:8px 18px; font-size:12.5px;" onclick="window.kioskApp.testPlaceTwoBooks('B008923', 'B008928')">
-                <i class="fas fa-layer-group"></i> Simulate 2 Live Books (B008923 + B008928)
-              </button>
-            </div>
+            <h5 style="color:#ffffff; margin:0 0 4px 0; font-size:15px;">Waiting for Book on RFID Mat / Scanner</h5>
+            <p style="font-size:12.5px; color:#cbd5e1; margin:0 0 14px 0;">
+              Place the book flat on the USB RFID pad, or scan the book's barcode below.
+            </p>
           </div>
         `;
       } else {
@@ -943,12 +934,15 @@ class NFSUKioskApp {
   // HARDWARE PAD SIMULATION TRIGGERS (FOR JUDGES & DEMONSTRATION)
   // =========================================================================
 
-  async testPlaceSingleBook(barcode = "NFSU-BK-104") {
+  async testPlaceSingleBook(barcode, title = null) {
+    if (!barcode || !barcode.trim()) return;
     try {
+      const payload = { barcode: barcode.trim() };
+      if (title && title.trim()) payload.title = title.trim();
       await fetch('/api/hardware/place-book', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ barcode })
+        body: JSON.stringify(payload)
       });
       await this.refreshPadOnly();
     } catch (e) {}

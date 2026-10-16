@@ -14,7 +14,7 @@ class KohaConfig(BaseModel):
     sip_port: int = int(os.getenv("KOHA_SIP_PORT", "6001"))
     sip_user: str = os.getenv("KOHA_SIP_USER", "rfid1")
     sip_pass: str = os.getenv("KOHA_SIP_PASS", "Rfid1@123")
-    sip_location: str = os.getenv("KOHA_SIP_LOCATION", "")
+    sip_location: str = os.getenv("KOHA_SIP_LOCATION", "NFSUGNR")
     institution_id: str = os.getenv("KOHA_INSTITUTION_ID", "NFSUGNR")
     terminal_password: str = os.getenv("KOHA_TERMINAL_PASSWORD", "")
     

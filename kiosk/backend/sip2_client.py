@@ -81,9 +81,6 @@ class SIP2Client:
             return True
 
         targets = [(self.host, self.port)]
-        # If primary target is live server, register local emulator as fallback
-        if self.host != "127.0.0.1":
-            targets.append(("127.0.0.1", 6001))
 
         for host, port in targets:
             try:
@@ -97,14 +94,14 @@ class SIP2Client:
                 self.is_emulator = (host in ("127.0.0.1", "localhost") and port == 6001)
                 
                 # 1. Koha 26 requires 93 Login FIRST
-                login_res = await self._send_raw_locked(
-                    self.builder.build_93_login(
-                        user=self.user,
-                        pwd=self.password,
-                        location=self.location
-                    ),
-                    timeout=2.0
+                login_msg = self.builder.build_93_login(
+                    user=self.user,
+                    pwd=self.password,
+                    location=self.location
                 )
+                print(f"[SIP2-CLIENT] Connecting to {host}:{port} -> 93 Msg: {repr(login_msg)}")
+                login_res = await self._send_raw_locked(login_msg, timeout=config.timeout_seconds)
+                print(f"[SIP2-CLIENT] 93 Resp from {host}:{port}: {login_res}")
                 if not login_res or not login_res.get("ok"):
                     print(f"[SIP2-CLIENT] Handshake 93 Login failed on {host}:{port}: {login_res}")
                     if self.writer:
@@ -121,7 +118,7 @@ class SIP2Client:
                 self.is_logged_in = True
 
                 # 2. Perform 99 -> 98 Status Handshake
-                status_res = await self._send_raw_locked(self.builder.build_99_sc_status(), timeout=2.0)
+                status_res = await self._send_raw_locked(self.builder.build_99_sc_status(), timeout=config.timeout_seconds)
                 if status_res and status_res.get("command") == "98":
                     self.last_status = status_res
                     self.last_heartbeat = datetime.now()
